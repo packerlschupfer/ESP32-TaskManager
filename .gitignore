@@ -1,0 +1,38 @@
+# PlatformIO build artifacts (at any level)
+**/.pio/
+**/.pioenvs/
+**/.piolibdeps/
+
+# IDE files (at any level)
+**/.vscode/
+**/.idea/
+**/*.code-workspace
+**/compile_commands.json
+
+# Build artifacts
+**/build/
+**/*.o
+**/*.a
+
+# OS files
+**/.DS_Store
+**/Thumbs.db
+**/*.swp
+
+# Temporary files
+**/*.tmp
+**/*.bak
+**/*~
+
+# Logs
+**/*.log
+
+# Local configuration (keep examples)
+**/*_local.*
+**/my_*.json
+**/custom_*.json
+!**/*.example.*
+
+# Compiled Python
+**/__pycache__/
+**/*.pyc
