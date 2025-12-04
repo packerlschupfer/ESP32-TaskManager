@@ -1,0 +1,3 @@
+[submodule "logger_submodule"]
+	path = logger_submodule
+	url = ../ESP32-Logger

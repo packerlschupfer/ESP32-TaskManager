@@ -1,0 +1,120 @@
+// test_optimized.cpp - Test the optimized TaskManager
+#include <Arduino.h>
+#include <Logger.h>
+#include <ConsoleBackend.h>
+#include "TaskManager.h"  // Now uses optimized version by default
+
+// Global instances
+Logger logger(std::make_shared<ConsoleBackend>());
+TaskManager taskManager;
+
+// Test task
+void testTask(void* pvParameters) {
+    const char* taskName = (const char*)pvParameters;
+    int counter = 0;
+    
+    while (true) {
+        logger.log(ESP_LOG_INFO, taskName, "Running - count: %d", counter++);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+// Watchdog task
+void watchdogTask(void* pvParameters) {
+    const char* tag = "WDT_TEST";
+    
+    // Register with watchdog
+    TaskManager::WatchdogConfig wdConfig = TaskManager::WatchdogConfig::enabled(false, 2000);
+    taskManager.registerCurrentTaskWithWatchdog("WatchdogTest", wdConfig);
+    
+    while (true) {
+        taskManager.feedWatchdog();
+        logger.log(ESP_LOG_INFO, tag, "Watchdog fed");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    while (!Serial && millis() < 5000) delay(10);
+    
+    Serial.println("\n=== Optimized TaskManager Test ===");
+    
+    // Initialize logger
+    logger.init(2048);
+    logger.enableLogging(true);
+    logger.setLogLevel(ESP_LOG_INFO);
+    
+    // Print initial memory
+    Serial.printf("Free heap at start: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    Serial.printf("TaskInfo size: %lu bytes\n", (unsigned long)sizeof(TaskManager::TaskInfo));
+    
+    // Initialize watchdog
+    #if TM_ENABLE_WATCHDOG
+    if (taskManager.initWatchdog(30, true)) {
+        logger.log(ESP_LOG_INFO, "SETUP", "Watchdog initialized");
+    }
+    #endif
+    
+    // Start debug task
+    #if TM_ENABLE_DEBUG_TASK
+    TaskHandle_t debugHandle = nullptr;
+    if (xTaskCreate(TaskManager::debugTaskWrapper, "DebugTask", 4096, &taskManager, 1, &debugHandle) == pdPASS) {
+        taskManager.debugTaskHandle = debugHandle;
+        taskManager.setResourceLogPeriod(10000);  // Every 10 seconds
+        logger.log(ESP_LOG_INFO, "SETUP", "Debug task started");
+    }
+    #endif
+    
+    // Create test tasks
+    taskManager.startTask(testTask, "Task1", 4096, (void*)"TASK1", 1);
+    taskManager.startTask(testTask, "Task2", 4096, (void*)"TASK2", 1);
+    
+    // Create pinned tasks
+    taskManager.startTaskPinned(testTask, "PinnedTask0", 4096, (void*)"PIN0", 1, 0);
+    taskManager.startTaskPinned(testTask, "PinnedTask1", 4096, (void*)"PIN1", 1, 1);
+    
+    // Create watchdog task
+    #if TM_ENABLE_WATCHDOG
+    TaskManager::WatchdogConfig wdConfig = TaskManager::WatchdogConfig::enabled(false, 3000);
+    taskManager.startTask(watchdogTask, "WatchdogTask", 4096, nullptr, 2, wdConfig);
+    #endif
+    
+    // Print statistics
+    vTaskDelay(pdMS_TO_TICKS(100));  // Let tasks start
+    
+    TaskManager::TaskStatistics stats = taskManager.getTaskStatistics();
+    logger.log(ESP_LOG_INFO, "SETUP", "Tasks created: %u total, %u pinned, %u watchdog",
+               stats.totalTasks, stats.pinnedTasks, stats.watchdogTasks);
+    
+    // Print memory after task creation
+    Serial.printf("Free heap after tasks: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    Serial.printf("Memory used by tasks: ~%lu bytes\n", 
+                  (unsigned long)(stats.totalTasks * sizeof(TaskManager::TaskInfo)));
+}
+
+void loop() {
+    static uint32_t lastReport = 0;
+    
+    if (millis() - lastReport > 30000) {
+        lastReport = millis();
+        
+        // Get current stats
+        TaskManager::TaskStatistics stats = taskManager.getTaskStatistics();
+        logger.log(ESP_LOG_INFO, "MAIN", "Status: %u tasks, heap: %lu bytes",
+                   stats.totalTasks, (unsigned long)ESP.getFreeHeap());
+        
+        #if TM_ENABLE_WATCHDOG
+        // Log watchdog stats
+        taskManager.logWatchdogStats();
+        #endif
+        
+        // Test task lookup
+        TaskHandle_t handle = taskManager.getTaskHandleByName("Task1");
+        if (handle) {
+            logger.log(ESP_LOG_INFO, "MAIN", "Found Task1 handle: %p", handle);
+        }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
