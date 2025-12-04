@@ -1,0 +1,734 @@
+// main.cpp - Comprehensive TaskManager Test Suite
+#include <Arduino.h>
+#include <Logger.h>
+#include <ConsoleBackend.h>
+#include <TaskManager.h>
+#include <SemaphoreGuard.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/event_groups.h"
+#include <esp_heap_caps.h>
+#include <esp_task_wdt.h>
+
+// Enable stack overflow detection
+#define configCHECK_FOR_STACK_OVERFLOW 2
+
+// Test configuration
+#define TEST_VERSION "1.0.0"
+#define TEST_BUILD_DATE __DATE__
+#define TEST_BUILD_TIME __TIME__
+
+// Global instances
+Logger logger(std::make_shared<ConsoleBackend>());
+TaskManager taskManager;
+
+// Event group for test coordination
+EventGroupHandle_t testEventGroup = nullptr;
+
+// Event bits
+#define EVENT_SYSTEM_READY          BIT0
+#define EVENT_WATCHDOG_TEST_START   BIT1
+#define EVENT_STRESS_TEST_START     BIT2
+#define EVENT_NAME_TEST_COMPLETE    BIT3
+#define EVENT_ALL_TESTS_COMPLETE    BIT4
+
+// Test statistics
+struct TestStats {
+    uint32_t totalTests;
+    uint32_t passedTests;
+    uint32_t failedTests;
+    uint32_t watchdogFeeds;
+    uint32_t watchdogMisses;
+    uint32_t memoryAllocations;
+    uint32_t memoryFailures;
+    uint32_t cpuCycles;
+    uint32_t taskCreations;
+    uint32_t taskDeletions;
+} testStats = {0};
+
+// Mutex for test stats
+SemaphoreHandle_t statsMutex = nullptr;
+
+// Global test control
+volatile bool runStressTests = true;
+volatile bool simulateWatchdogFailure = false;
+
+// Memory stress configuration
+const size_t HEAP_STRESS_CHUNK_SIZE = 4096;
+const size_t MAX_HEAP_ALLOCATIONS = 100;
+std::vector<void*> heapAllocations;
+
+// Stack overflow handler
+extern "C" void vApplicationStackOverflowHook(TaskHandle_t xTask, char* pcTaskName) {
+    if (pcTaskName) {
+        logger.log(ESP_LOG_ERROR, "SYSTEM", "Stack overflow in task: %s", pcTaskName);
+        Serial.printf("FATAL: Stack overflow in task %s\n", pcTaskName);
+    }
+    Serial.flush();
+    esp_restart();
+}
+
+// ===== Test Tasks =====
+
+// Task 1: Test TaskNames functionality
+void TaskNamesTestTask(void* pvParameters) {
+    const char* tag = "NAMES";
+    testStats.totalTests++;
+    
+    // IMPORTANT: Wait a bit for task registration to complete
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Test 1: Verify our own task names
+    std::string fullName = "TaskNamesTestTask";
+    std::string freertosName = taskManager.getFreeRTOSNameByFullName(fullName);
+    std::string logTag = taskManager.getLogTagByFullName(fullName);
+    
+    logger.log(ESP_LOG_INFO, tag, "=== TaskNames Test Results ===");
+    logger.log(ESP_LOG_INFO, tag, "Full name: '%s'", fullName.c_str());
+    logger.log(ESP_LOG_INFO, tag, "FreeRTOS name: '%s' (length: %d)", 
+               freertosName.c_str(), freertosName.length());
+    logger.log(ESP_LOG_INFO, tag, "Log tag: '%s'", logTag.c_str());
+    
+    // Verify FreeRTOS name truncation
+    if (!freertosName.empty() && freertosName.length() < configMAX_TASK_NAME_LEN) {
+        logger.log(ESP_LOG_INFO, tag, "✓ FreeRTOS name properly truncated");
+        testStats.passedTests++;
+    } else {
+        logger.log(ESP_LOG_ERROR, tag, "✗ FreeRTOS name issue: '%s'", freertosName.c_str());
+        testStats.failedTests++;
+    }
+    
+    // Test 2: Get all log tags
+    std::vector<std::string> allTags = taskManager.getAllLogTags();
+    logger.log(ESP_LOG_INFO, tag, "Total log tags in system: %d", allTags.size());
+    for (const auto& t : allTags) {
+        logger.log(ESP_LOG_DEBUG, tag, "  - Tag: '%s'", t.c_str());
+    }
+    
+    // Test 3: Configure log levels
+    taskManager.configureTaskLogLevel("TaskNamesTestTask", ESP_LOG_VERBOSE);
+    logger.log(ESP_LOG_VERBOSE, tag, "This should be visible after level change");
+    
+    // Test 4: Group log level configuration
+    taskManager.configureTaskGroupLogLevel("Test", ESP_LOG_DEBUG);
+    
+    // Test 5: Verify task info structure
+    const auto& taskList = taskManager.getTaskList();
+    bool found = false;
+    for (const auto& task : taskList) {
+        if (task.taskName == fullName) {
+            found = true;
+            logger.log(ESP_LOG_INFO, tag, "Task found in list:");
+            logger.log(ESP_LOG_INFO, tag, "  - Full: '%s'", task.taskName.c_str());
+            logger.log(ESP_LOG_INFO, tag, "  - FreeRTOS: '%s'", task.freertosName.c_str());
+            logger.log(ESP_LOG_INFO, tag, "  - Abbrev: '%s'", task.abbreviatedName.c_str());
+            logger.log(ESP_LOG_INFO, tag, "  - LogTag: '%s'", task.logTag.c_str());
+            break;
+        }
+    }
+    
+    if (!found) {
+        logger.log(ESP_LOG_ERROR, tag, "✗ Task not found in task list!");
+        testStats.failedTests++;
+    } else {
+        logger.log(ESP_LOG_INFO, tag, "✓ Task found in task list");
+        testStats.passedTests++;
+    }
+    
+    xEventGroupSetBits(testEventGroup, EVENT_NAME_TEST_COMPLETE);
+    
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+}
+
+// Task 2: Watchdog stress test (FIXED)
+void WatchdogStressTask(void* pvParameters) {
+    const char* tag = "WDTEST";
+    uint32_t feedCount = 0;
+    uint32_t intentionalMisses = 0;
+    
+    // Wait for task to be fully registered
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Configure as critical watchdog task with 5 second interval (more realistic)
+    TaskManager::WatchdogConfig wdConfig = TaskManager::WatchdogConfig::enabled(true, 5000);
+    if (!taskManager.registerCurrentTaskWithWatchdog("WatchdogStressTask", wdConfig)) {
+        logger.log(ESP_LOG_ERROR, tag, "Failed to register with watchdog!");
+        testStats.failedTests++;
+    } else {
+        logger.log(ESP_LOG_INFO, tag, "Registered as critical watchdog task");
+        testStats.passedTests++;
+    }
+    
+    while (true) {
+        // Feed watchdog at start of loop
+        if (!simulateWatchdogFailure) {
+            if (taskManager.feedWatchdog()) {
+                feedCount++;
+                if (feedCount % 10 == 0) {
+                    logger.log(ESP_LOG_DEBUG, tag, "Fed watchdog %u times", feedCount);
+                }
+            }
+        }
+        
+        // Normal operation - 3 second cycle (well within 5 second interval)
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        
+        // Simulate occasional missed feeds only after many successful feeds
+        if (feedCount > 50 && feedCount % 50 == 0 && !simulateWatchdogFailure) {
+            logger.log(ESP_LOG_WARN, tag, "Simulating delayed feed...");
+            vTaskDelay(pdMS_TO_TICKS(3000)); // Extra delay but still under timeout
+            intentionalMisses++;
+        }
+        
+        // Get and log watchdog statistics
+        if (feedCount % 30 == 0 && feedCount > 0) {
+            uint32_t missedFeeds, totalFeeds;
+            if (taskManager.getTaskWatchdogStats("WatchdogStressTask", missedFeeds, totalFeeds)) {
+                logger.log(ESP_LOG_INFO, tag, 
+                          "Watchdog stats - Total: %u, Missed: %u, Intentional: %u",
+                          totalFeeds, missedFeeds, intentionalMisses);
+                
+                SemaphoreGuard guard(statsMutex);
+                testStats.watchdogFeeds = totalFeeds;
+                testStats.watchdogMisses = missedFeeds;
+            }
+        }
+    }
+
+    // Unreachable code, but good practice for completeness
+    taskManager.unregisterCurrentTaskFromWatchdog();
+    vTaskDelete(nullptr);
+}
+
+// Task 3: CPU intensive stress test (SAFE VERSION)
+void CpuStressTask(void* pvParameters) {
+    const char* tag = (const char*)pvParameters;
+    volatile float result = 0.0;
+    uint32_t cycles = 0;
+    
+    // Wait for system to stabilize
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Non-critical watchdog with 10 second interval
+    TaskManager::WatchdogConfig wdConfig = TaskManager::WatchdogConfig::enabled(false, 10000);
+    taskManager.registerCurrentTaskWithWatchdog(tag, wdConfig);
+    
+    while (runStressTests) {
+        // Process in controlled batches
+        for (int batch = 0; batch < 100; batch++) {
+            // Simple calculations to avoid stack issues
+            for (int i = 0; i < 100; i++) {
+                result += (float)(cycles % 1000) * 0.001f;
+                result = fmodf(result, 1000000.0f); // Keep result bounded
+                cycles++;
+            }
+            
+            // Yield frequently
+            if (batch % 10 == 0) {
+                taskYIELD();
+            }
+        }
+        
+        // Update stats
+        if (cycles >= 1000000) {
+            SemaphoreGuard guard(statsMutex);
+            testStats.cpuCycles = cycles;
+            logger.log(ESP_LOG_INFO, tag, "CPU cycles: %u M, result: %.2f", 
+                      cycles / 1000000, result);
+            cycles = 0; // Reset to prevent overflow
+        }
+        
+        // Feed watchdog
+        taskManager.feedWatchdog();
+        
+        // Mandatory delay for system health
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    // IMPORTANT: Unregister from watchdog before exiting
+    logger.log(ESP_LOG_INFO, tag, "Unregistering from watchdog before exit");
+    taskManager.unregisterCurrentTaskFromWatchdog();
+    vTaskDelay(pdMS_TO_TICKS(50)); // Small delay to ensure it takes effect
+    
+    logger.log(ESP_LOG_INFO, tag, "Task exiting cleanly");
+    vTaskDelete(nullptr);
+}
+
+
+// Task 4: Memory allocation stress test (SAFE VERSION)
+void MemoryStressTask(void* pvParameters) {
+    const char* tag = "MEMSTRESS";
+    uint32_t allocCount = 0;
+    uint32_t failCount = 0;
+    const size_t MAX_ALLOCS = 20; // Limit number of allocations
+    
+    // Wait for system to stabilize
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    while (runStressTests) {
+        // Limited allocations to prevent heap exhaustion
+        if (heapAllocations.size() < MAX_ALLOCS) {
+            size_t chunkSize = 512 + (random(0, 8) * 512); // 512-4096 bytes
+            void* chunk = malloc(chunkSize);
+            
+            if (chunk) {
+                memset(chunk, allocCount & 0xFF, chunkSize);
+                heapAllocations.push_back(chunk);
+                allocCount++;
+            } else {
+                failCount++;
+            }
+        }
+        
+        // Deallocate some blocks
+        if (heapAllocations.size() > 10 && random(0, 100) < 50) {
+            size_t index = random(0, heapAllocations.size());
+            free(heapAllocations[index]);
+            heapAllocations.erase(heapAllocations.begin() + index);
+        }
+        
+        // Log periodically
+        if ((allocCount + failCount) % 50 == 0) {
+            logger.log(ESP_LOG_INFO, tag, 
+                      "Allocs: %u, Fails: %u, Current: %u blocks",
+                      allocCount, failCount, heapAllocations.size());
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    // Cleanup
+    for (void* ptr : heapAllocations) {
+        free(ptr);
+    }
+    heapAllocations.clear();
+    
+    vTaskDelete(nullptr);
+}
+
+// Task 5: Stack stress test (SAFE VERSION)
+void StackStressTask(void* pvParameters) {
+    const char* tag = "STACKSTRESS";
+    uint32_t iterations = 0;
+    
+    // Wait for system to stabilize
+    vTaskDelay(pdMS_TO_TICKS(300));
+    
+    while (runStressTests) {
+        // Non-recursive stack usage
+        uint8_t stackBuffer[512]; // Reasonable size
+        memset(stackBuffer, iterations & 0xFF, sizeof(stackBuffer));
+        
+        // Simple calculation using stack buffer
+        uint32_t checksum = 0;
+        for (size_t i = 0; i < sizeof(stackBuffer); i++) {
+            checksum += stackBuffer[i];
+        }
+        
+        iterations++;
+        
+        // Check stack usage
+        if (iterations % 20 == 0) {
+            UBaseType_t stackRemaining = uxTaskGetStackHighWaterMark(nullptr);
+            logger.log(ESP_LOG_INFO, tag, 
+                      "Iteration %u, Stack remaining: %u words, Checksum: %u",
+                      iterations, stackRemaining, checksum);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    vTaskDelete(nullptr);
+}
+
+// Task 6: Dynamic task creation (SAFE VERSION)
+void DynamicTaskStress(void* pvParameters) {
+    const char* tag = "DYNAMIC";
+    uint32_t cycleCount = 0;
+    uint32_t totalCreated = 0;
+    uint32_t totalDeleted = 0;
+    
+    // Wait for system to stabilize
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    while (runStressTests) {
+        cycleCount++;
+        std::vector<TaskHandle_t> handles;
+        
+        // Check heap before creating tasks
+        size_t heapBefore = ESP.getFreeHeap();
+        if (heapBefore < 50000) {
+            logger.log(ESP_LOG_WARN, tag, "Low heap, skipping cycle: %u bytes", heapBefore);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        
+        // Create batch of tasks with different configurations
+        for (int i = 0; i < 3; i++) {  // Reduced from 5 to 3
+            char taskName[32];
+            snprintf(taskName, sizeof(taskName), "DynTask_%lu_%d", (unsigned long)cycleCount, i);
+            
+            // Use TaskNames struct
+            TaskManager::TaskNames names(taskName, "", "DYN");
+            
+            // CRITICAL FIX: Adequate stack sizes starting at 4KB minimum
+            uint16_t stackSize = 4096 + (i * 1024);  // 4KB, 5KB, 6KB
+            UBaseType_t priority = 1 + (i % 3);
+            
+            // Lambda task function with minimal stack usage
+            auto taskFunc = [](void* param) {
+                int taskId = (int)(intptr_t)param;
+                
+                // Simple work without heavy logging
+                volatile uint32_t counter = 0;
+                for (int j = 0; j < 1000; j++) {
+                    counter += j;
+                    if (j % 100 == 0) {
+                        taskYIELD();
+                    }
+                }
+                
+                // Variable delay based on task ID
+                vTaskDelay(pdMS_TO_TICKS(500 + taskId * 200));
+                
+                // Exit cleanly
+                vTaskDelete(nullptr);
+            };
+            
+            // Create task with proper API - use the TaskNames overload
+            if (taskManager.startTask(taskFunc, names, stackSize, 
+                                     (void*)(intptr_t)i, priority)) {
+                totalCreated++;
+                // Note: We can't get the handle with this API, but that's OK
+            } else {
+                logger.log(ESP_LOG_WARN, tag, "Failed to create task %s", taskName);
+            }
+        }
+        
+        size_t heapAfter = ESP.getFreeHeap();
+        logger.log(ESP_LOG_INFO, tag, 
+                  "Cycle %lu: Created %d tasks, heap: %u -> %u (used %u)",
+                  (unsigned long)cycleCount, 3, heapBefore, heapAfter, 
+                  heapBefore - heapAfter);
+        
+        // Wait for tasks to complete
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        totalDeleted += 3;
+        
+        // Update stats
+        {
+            SemaphoreGuard guard(statsMutex);
+            testStats.taskCreations = totalCreated;
+            testStats.taskDeletions = totalDeleted;
+        }
+        
+        // Delay between cycles
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    
+    vTaskDelete(nullptr);
+}
+
+// Task 7: Multi-core stress (SAFE VERSION)
+void CoreStressTask(void* pvParameters) {
+    BaseType_t coreId = (BaseType_t)(intptr_t)pvParameters;
+    char tag[16];
+    snprintf(tag, sizeof(tag), "CORE%d", coreId);
+    
+    uint32_t counter = 0;
+    
+    // Wait for system to stabilize
+    vTaskDelay(pdMS_TO_TICKS(100 * (coreId + 1)));
+    
+    while (runStressTests) {
+        // Verify we're on the correct core
+        BaseType_t currentCore = xPortGetCoreID();
+        if (currentCore != coreId) {
+            logger.log(ESP_LOG_WARN, tag, "Running on wrong core! Expected %d, got %d",
+                      coreId, currentCore);
+        }
+        
+        // Simple workload
+        for (int i = 0; i < 10000; i++) {
+            counter++;
+            if (i % 1000 == 0) {
+                taskYIELD();
+            }
+        }
+        
+        if (counter % 1000000 == 0) {
+            logger.log(ESP_LOG_INFO, tag, "Core %d counter: %u M",
+                      coreId, counter / 1000000);
+        }
+        
+        // Regular delay
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    vTaskDelete(nullptr);
+}
+
+// Main test monitoring task
+void TestMonitorTask(void* pvParameters) {
+    const char* tag = "MONITOR";
+    TickType_t startTime = xTaskGetTickCount();
+    
+    // Wait for initial tests to start
+    xEventGroupWaitBits(testEventGroup, EVENT_NAME_TEST_COMPLETE, 
+                       pdFALSE, pdTRUE, pdMS_TO_TICKS(5000));
+    
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds between reports
+        
+        // Print comprehensive test report
+        logger.log(ESP_LOG_INFO, tag, "");
+        logger.log(ESP_LOG_INFO, tag, "=== TEST REPORT ===");
+        logger.log(ESP_LOG_INFO, tag, "Runtime: %u seconds", 
+                  pdTICKS_TO_MS(xTaskGetTickCount() - startTime) / 1000);
+        
+        {
+            SemaphoreGuard guard(statsMutex);
+            logger.log(ESP_LOG_INFO, tag, "Tests: Total=%u, Passed=%u, Failed=%u",
+                      testStats.totalTests, testStats.passedTests, testStats.failedTests);
+            logger.log(ESP_LOG_INFO, tag, "Watchdog: Feeds=%u, Misses=%u",
+                      testStats.watchdogFeeds, testStats.watchdogMisses);
+            logger.log(ESP_LOG_INFO, tag, "Memory: Allocs=%u, Failures=%u",
+                      testStats.memoryAllocations, testStats.memoryFailures);
+            logger.log(ESP_LOG_INFO, tag, "CPU Cycles: %u M", testStats.cpuCycles / 1000000);
+            logger.log(ESP_LOG_INFO, tag, "Tasks: Created=%u, Deleted=%u",
+                      testStats.taskCreations, testStats.taskDeletions);
+        }
+        
+        // System resource report
+        logger.log(ESP_LOG_INFO, tag, "");
+        logger.log(ESP_LOG_INFO, tag, "=== SYSTEM RESOURCES ===");
+        logger.log(ESP_LOG_INFO, tag, "Free Heap: %u bytes", ESP.getFreeHeap());
+        logger.log(ESP_LOG_INFO, tag, "Largest Free Block: %u bytes", ESP.getMaxAllocHeap());
+        logger.log(ESP_LOG_INFO, tag, "Min Free Heap Ever: %u bytes", ESP.getMinFreeHeap());
+        
+        if (psramFound()) {
+            logger.log(ESP_LOG_INFO, tag, "Free PSRAM: %u bytes", ESP.getFreePsram());
+        }
+        
+        // Task list and watchdog stats
+        taskManager.logWatchdogStats();
+        
+        // Get accurate task statistics
+        auto stats = taskManager.getTaskStatistics();
+        
+        logger.log(ESP_LOG_INFO, tag, "");
+        logger.log(ESP_LOG_INFO, tag, "=== TASK STATISTICS ===");
+        logger.log(ESP_LOG_INFO, tag, "Total tasks in list: %u", stats.totalTasks);
+        logger.log(ESP_LOG_INFO, tag, "  Running: %u", stats.runningTasks);
+        logger.log(ESP_LOG_INFO, tag, "  Blocked: %u", stats.blockedTasks);
+        logger.log(ESP_LOG_INFO, tag, "  Ready: %u", stats.readyTasks);
+        logger.log(ESP_LOG_INFO, tag, "  Suspended: %u", stats.suspendedTasks);
+        logger.log(ESP_LOG_INFO, tag, "  Deleted: %u", stats.deletedTasks);
+        logger.log(ESP_LOG_INFO, tag, "  Invalid handles: %u", stats.invalidHandles);
+        logger.log(ESP_LOG_INFO, tag, "  Watchdog monitored: %u", stats.watchdogTasks);
+        
+        // Print all task info with safety checks
+        const auto& taskList = taskManager.getTaskList();
+        logger.log(ESP_LOG_INFO, tag, "");
+        logger.log(ESP_LOG_INFO, tag, "=== TASK DETAILS (%u tasks) ===", taskList.size());
+        
+        for (const auto& task : taskList) {
+            // SAFETY CHECK: Verify task handle is valid before using it
+            if (task.taskHandle != nullptr) {
+                // Check handle validity
+                uintptr_t handleValue = (uintptr_t)(task.taskHandle);
+                if (handleValue < 0x3FFB0000 || handleValue > 0x3FFFFFFF) {
+                    logger.log(ESP_LOG_DEBUG, tag, 
+                              "%s: BAD HANDLE %p",
+                              task.abbreviatedName.c_str(),
+                              task.taskHandle);
+                    continue;
+                }
+                
+                // Try to get task state first - this is safer
+                eTaskState state = eTaskGetState(task.taskHandle);
+                
+                // Only proceed if task is in a known good state
+                // Skip eReady as it might be a task that's about to be deleted
+                if (state == eRunning || state == eBlocked || state == eSuspended) {
+                    // Task is definitely still alive, safe to get stack info
+                    UBaseType_t stackHWM = uxTaskGetStackHighWaterMark(task.taskHandle);
+                    
+                    logger.log(ESP_LOG_INFO, tag, 
+                              "%s: State=%s, Stack HWM=%u, WDT=%s%s",
+                              task.abbreviatedName.c_str(),
+                              TaskManager::taskStateToStringShort(state),
+                              stackHWM,
+                              task.watchdogEnabled ? "ON" : "OFF",
+                              task.watchdogCritical ? "-CRIT" : "");
+                } else if (state == eReady) {
+                    // Task might be valid or might be about to be deleted
+                    // Log without stack info to be safe
+                    logger.log(ESP_LOG_INFO, tag, 
+                              "%s: State=%s, Stack HWM=?, WDT=%s%s",
+                              task.abbreviatedName.c_str(),
+                              TaskManager::taskStateToStringShort(state),
+                              task.watchdogEnabled ? "ON" : "OFF",
+                              task.watchdogCritical ? "-CRIT" : "");
+                } else {
+                    // Task is deleted or invalid
+                    logger.log(ESP_LOG_DEBUG, tag, 
+                              "%s: State=%s (deleted/invalid)",
+                              task.abbreviatedName.c_str(),
+                              TaskManager::taskStateToStringShort(state));
+                }
+            } else {
+                logger.log(ESP_LOG_DEBUG, tag, 
+                          "%s: NULL handle",
+                          task.abbreviatedName.c_str());
+            }
+        }
+        
+        // Summary with accurate counts
+        uint32_t activeTasks = stats.runningTasks + stats.blockedTasks + 
+                              stats.readyTasks + stats.suspendedTasks;
+        uint32_t inactiveTasks = stats.deletedTasks + stats.invalidHandles;
+        
+        logger.log(ESP_LOG_INFO, tag, "Summary: %u active, %u inactive, %u total in list",
+                  activeTasks, inactiveTasks, stats.totalTasks);
+        logger.log(ESP_LOG_INFO, tag, "==================");
+    }
+}
+
+// Setup function
+void setup() {
+    // Initialize serial
+    Serial.begin(115200);
+    while (!Serial && millis() < 5000) delay(10);
+    
+    Serial.println("\n\n=== TaskManager Comprehensive Test Suite ===");
+    Serial.printf("Version: %s\n", TEST_VERSION);
+    Serial.printf("Build: %s %s\n", TEST_BUILD_DATE, TEST_BUILD_TIME);
+    Serial.println("===========================================\n");
+    
+    // Initialize logger
+    logger.init(2048);
+    logger.enableLogging(true);
+    logger.setLogLevel(ESP_LOG_VERBOSE);
+    logger.setMaxLogsPerSecond(200); // High frequency for stress testing
+    
+    // Create synchronization primitives
+    testEventGroup = xEventGroupCreate();
+    statsMutex = xSemaphoreCreateMutex();
+    
+    if (!testEventGroup || !statsMutex) {
+        Serial.println("FATAL: Failed to create sync primitives");
+        return;
+    }
+    
+    // System info
+    logger.log(ESP_LOG_INFO, "SETUP", "ESP32 Model: %s", ESP.getChipModel());
+    logger.log(ESP_LOG_INFO, "SETUP", "CPU Freq: %d MHz", ESP.getCpuFreqMHz());
+    logger.log(ESP_LOG_INFO, "SETUP", "Free Heap: %d bytes", ESP.getFreeHeap());
+    logger.log(ESP_LOG_INFO, "SETUP", "Flash Size: %d KB", ESP.getFlashChipSize() / 1024);
+    
+    // Initialize watchdog
+    logger.log(ESP_LOG_INFO, "SETUP", "Initializing watchdog...");
+    if (taskManager.initWatchdog(30, true)) {
+        logger.log(ESP_LOG_INFO, "SETUP", "✓ Watchdog initialized successfully");
+    } else {
+        logger.log(ESP_LOG_ERROR, "SETUP", "✗ Watchdog initialization failed!");
+    }
+    
+    // Start debug task with adequate stack
+    logger.log(ESP_LOG_INFO, "SETUP", "Starting debug task...");
+    if (taskManager.startTask(&TaskManager::debugTask, "DebugTask", 12288, 7, "DBG")) {
+        taskManager.debugTaskHandle = taskManager.getTaskHandleByName("DebugTask");
+        taskManager.setTaskExecutionInterval(1000);   // Fast monitoring
+        taskManager.setResourceLogPeriod(10000);      // Every 10 seconds
+        logger.log(ESP_LOG_INFO, "SETUP", "✓ Debug task started");
+    }
+    
+    // Start all test tasks with ADEQUATE stack sizes
+    logger.log(ESP_LOG_INFO, "SETUP", "Starting test tasks...");
+    
+    // 1. TaskNames test - 6KB stack
+    TaskManager::TaskNames nameTestNames("TaskNamesTestTask", "NAME", "NameTest");
+    taskManager.startTask(TaskNamesTestTask, nameTestNames, 6144, nullptr, 3);
+    
+    // 2. Watchdog stress test - 6KB stack
+    taskManager.startTask(WatchdogStressTask, "WatchdogStressTask", 6144, nullptr, 5, "WDT");
+    
+    // 3. CPU stress tasks - 4KB stack (reduced priority)
+    taskManager.startTask(CpuStressTask, "CpuStressTask1", 4096, (void*)"CPU1", 2, "CPU1");
+    taskManager.startTask(CpuStressTask, "CpuStressTask2", 4096, (void*)"CPU2", 2, "CPU2");
+    
+    // 4. Memory stress - 8KB stack (needs more for vector operations)
+    taskManager.startTask(MemoryStressTask, "MemoryStressTask", 8192, nullptr, 3, "MEM");
+    
+    // 5. Stack stress - 16KB stack (intentionally large for testing)
+    taskManager.startTask(StackStressTask, "StackStressTask", 16384, nullptr, 2, "STK");
+    
+    // 6. Dynamic task stress - 6KB stack
+    taskManager.startTask(DynamicTaskStress, "DynamicTaskStress", 6144, nullptr, 2, "DYN");
+    
+    // 7. Core-pinned stress tasks - 4KB stack (was 2KB - too small!)
+    taskManager.startTaskPinned(CoreStressTask, "CoreStress0", 4096, (void*)0, 2, 0, "CR0");
+    taskManager.startTaskPinned(CoreStressTask, "CoreStress1", 4096, (void*)1, 2, 1, "CR1");
+    
+    // 8. Test monitor - 6KB stack
+    taskManager.startTask(TestMonitorTask, "TestMonitor", 6144, nullptr, 1, "MON");
+    
+    // Configure log levels for groups
+    taskManager.configureTaskGroupLogLevel("Stress", ESP_LOG_INFO);
+    taskManager.configureTaskGroupLogLevel("Cpu", ESP_LOG_DEBUG);
+    
+    xEventGroupSetBits(testEventGroup, EVENT_SYSTEM_READY);
+    
+    logger.log(ESP_LOG_INFO, "SETUP", "=== All test tasks started ===");
+    logger.log(ESP_LOG_INFO, "SETUP", "Total tasks: %u", taskManager.getTaskList().size());
+    
+    // Log initial stack usage
+    logger.log(ESP_LOG_INFO, "SETUP", "Initial free heap: %d bytes", ESP.getFreeHeap());
+    
+    delay(1000);
+}
+
+// Main loop
+void loop() {
+    static uint32_t loopCount = 0;
+    static uint32_t lastReportTime = 0;
+    
+    loopCount++;
+    
+    // Simple heartbeat
+    if (millis() - lastReportTime > 30000) {
+        lastReportTime = millis();
+        logger.log(ESP_LOG_INFO, "MAIN", "Main loop alive - iteration %u", loopCount);
+        
+        // Toggle stress test phases
+        static int phase = 0;
+        phase++;
+        
+        switch (phase % 4) {
+            case 0:
+                logger.log(ESP_LOG_INFO, "MAIN", "Entering maximum stress phase");
+                runStressTests = true;
+                break;
+            case 1:
+                logger.log(ESP_LOG_INFO, "MAIN", "Reducing stress for recovery");
+                runStressTests = false;
+                break;
+            case 2:
+                logger.log(ESP_LOG_INFO, "MAIN", "Testing watchdog edge cases");
+                simulateWatchdogFailure = true;
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                simulateWatchdogFailure = false;
+                break;
+            case 3:
+                logger.log(ESP_LOG_INFO, "MAIN", "Normal operation phase");
+                runStressTests = true;
+                break;
+        }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}

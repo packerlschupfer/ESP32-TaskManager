@@ -1,0 +1,46 @@
+{
+  "name": "ESP32-TaskManager",
+  "version": "0.1.0",
+  "description": "FreeRTOS task lifecycle management with watchdog integration and stack monitoring for ESP32",
+  "keywords": [
+    "task",
+    "freertos",
+    "esp32",
+    "watchdog",
+    "thread",
+    "management",
+    "monitoring",
+    "embedded"
+  ],
+  "authors": [
+    {
+      "name": "packerlschupfer",
+      "email": "packerlschupfer@noreply.github.com",
+      "maintainer": true
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/packerlschupfer/ESP32-TaskManager.git"
+  },
+  "homepage": "https://github.com/packerlschupfer/ESP32-TaskManager",
+  "license": "MIT",
+  "frameworks": [
+    "arduino",
+    "espidf"
+  ],
+  "platforms": [
+    "espressif32"
+  ],
+  "headers": "TaskManager.h",
+  "dependencies": {
+    "ESP32-Watchdog": "file:///home/mrnice/.platformio/lib/ESP32-Watchdog",
+    "ESP32-MutexGuard": "file:///home/mrnice/.platformio/lib/ESP32-MutexGuard"
+  },
+  "export": {
+    "include": [
+      "src/TaskManager.h",
+      "src/TaskManager.cpp"
+    ]
+  }
+}
