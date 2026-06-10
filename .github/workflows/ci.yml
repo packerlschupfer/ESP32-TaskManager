@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile examples (PlatformIO / esp32)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('library.json', 'examples/**/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Compile examples
+        run: |
+          set -u
+          shopt -s nullglob
+          attempted=0
+          failed=0
+          for d in examples/*/; do
+            [ -f "${d}platformio.ini" ] || continue
+            echo "::group::pio run -d $d"
+            pio run -d "$d" || { failed=$((failed + 1)); echo "FAILED: $d"; }
+            echo "::endgroup::"
+            attempted=$((attempted + 1))
+          done
+          echo "Attempted $attempted example(s); $failed failed."
+          [ "$attempted" -gt 0 ] && [ "$failed" -eq 0 ]
