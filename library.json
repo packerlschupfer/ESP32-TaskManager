@@ -33,6 +33,9 @@
     "espressif32"
   ],
   "headers": "TaskManager.h",
+  "build": {
+    "srcFilter": "+<*> -<TaskManager_Full.cpp>"
+  },
   "dependencies": {
     "ESP32-Watchdog": "https://github.com/packerlschupfer/ESP32-Watchdog.git",
     "ESP32-MutexGuard": "https://github.com/packerlschupfer/ESP32-MutexGuard.git"

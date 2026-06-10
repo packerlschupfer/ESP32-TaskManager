@@ -3,6 +3,7 @@
 #define TASK_RECOVERY_H
 
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>   // for SemaphoreHandle_t / xSemaphore* used below
 #include <freertos/task.h>
 #include <functional>
 #include <vector>
