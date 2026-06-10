@@ -36,7 +36,13 @@ jobs:
           for d in examples/*/; do
             [ -f "${d}platformio.ini" ] || continue
             echo "::group::pio run -d $d"
-            pio run -d "$d" || { failed=$((failed + 1)); echo "FAILED: $d"; }
+            n=0
+            until pio run -d "$d"; do
+              n=$((n + 1))
+              if [ "$n" -ge 3 ]; then failed=$((failed + 1)); echo "FAILED: $d"; break; fi
+              echo "::warning::transient PlatformIO install/copy failure on $d, retry $n"
+              rm -rf "${d}.pio"
+            done
             echo "::endgroup::"
             attempted=$((attempted + 1))
           done
